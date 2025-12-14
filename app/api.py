@@ -2,13 +2,15 @@
 FastAPI REST API for the banking service with DbC validation.
 
 This module provides HTTP endpoints that wrap the banking logic
-and map contract violations to appropriate HTTP error responses.
+and uses fastapi-icontract to automatically enforce contracts and
+include them in the OpenAPI specification.
 """
 
 from typing import Dict
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel, Field
 import icontract
+from fastapi_icontract import require, ensure
 
 from .banking import BankAccount
 
@@ -66,77 +68,87 @@ app = FastAPI(
 )
 
 
-def handle_contract_violation(e: icontract.ViolationError, context: str) -> HTTPException:
+# Note: With fastapi-icontract, we don't need manual error handling.
+# The library automatically maps contract violations to HTTP errors.
+# However, we keep this for reference and potential custom error handling.
+def handle_contract_violation(e: icontract.ViolationError, context: str) -> dict:
     """
-    Map icontract violations to appropriate HTTP errors.
-    
-    - Precondition failures related to amounts -> 422 (Unprocessable Entity)
-    - Precondition failures related to insufficient funds -> 409 (Conflict)
-    - Other violations -> 400 (Bad Request)
+    Custom error detail formatter for contract violations.
+
+    This is now optional with fastapi-icontract, but can be used
+    for custom error formatting if needed.
     """
     error_message = str(e)
-    
+
     if "Insufficient funds" in error_message:
-        return HTTPException(status_code=409, detail={
+        return {
             "error": "insufficient_funds",
             "message": error_message,
             "context": context
-        })
+        }
     elif "same account" in error_message:
-        return HTTPException(status_code=422, detail={
+        return {
             "error": "invalid_transfer",
             "message": error_message,
             "context": context
-        })
+        }
     elif "must be positive" in error_message:
-        return HTTPException(status_code=422, detail={
+        return {
             "error": "invalid_amount",
             "message": error_message,
             "context": context
-        })
+        }
     else:
-        return HTTPException(status_code=400, detail={
+        return {
             "error": "contract_violation",
             "message": error_message,
             "context": context
-        })
+        }
 
 
 @app.post("/deposit", response_model=AccountResponse)
+@require(
+    lambda request: request.amount > 0,
+    status_code=422,
+    description="Deposit amount must be positive"
+)
 async def deposit(request: DepositRequest) -> AccountResponse:
     """
     Deposit funds into an account.
-    
+
     Creates the account if it doesn't exist.
-    
-    Contract validations:
-    - amount must be > 0
+
+    Contract validations (enforced by fastapi-icontract):
+    - amount must be > 0 (precondition)
     """
-    try:
-        account = get_or_create_account(request.account_id)
-        account.deposit(request.amount)
-        return AccountResponse(
-            account_id=account.account_id,
-            balance=account.balance,
-            message=f"Successfully deposited {request.amount}"
-        )
-    except icontract.ViolationError as e:
-        raise handle_contract_violation(e, "deposit")
+    account = get_or_create_account(request.account_id)
+    account.deposit(request.amount)
+    return AccountResponse(
+        account_id=account.account_id,
+        balance=account.balance,
+        message=f"Successfully deposited {request.amount}"
+    )
 
 
 @app.post("/withdraw", response_model=AccountResponse)
+@require(
+    lambda request: request.amount > 0,
+    status_code=422,
+    description="Withdrawal amount must be positive"
+)
 async def withdraw(request: WithdrawRequest) -> AccountResponse:
     """
     Withdraw funds from an account.
-    
+
     Creates the account if it doesn't exist (will fail if withdrawing from zero balance).
-    
-    Contract validations:
-    - amount must be > 0
-    - account must have sufficient funds
+
+    Contract validations (enforced by fastapi-icontract):
+    - amount must be > 0 (precondition)
+    - account must have sufficient funds (enforced by BankAccount.withdraw)
     """
+    account = get_or_create_account(request.account_id)
+    # The BankAccount.withdraw method has its own contracts that will be enforced
     try:
-        account = get_or_create_account(request.account_id)
         account.withdraw(request.amount)
         return AccountResponse(
             account_id=account.account_id,
@@ -144,24 +156,41 @@ async def withdraw(request: WithdrawRequest) -> AccountResponse:
             message=f"Successfully withdrew {request.amount}"
         )
     except icontract.ViolationError as e:
-        raise handle_contract_violation(e, "withdraw")
+        # Map specific contract violations to appropriate HTTP status codes
+        error_msg = str(e)
+        if "Insufficient funds" in error_msg:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=409, detail=handle_contract_violation(e, "withdraw"))
+        raise
 
 
 @app.post("/transfer", response_model=TransferResponse)
+@require(
+    lambda request: request.amount > 0,
+    status_code=422,
+    description="Transfer amount must be positive"
+)
+@require(
+    lambda request: request.from_id != request.to_id,
+    status_code=422,
+    description="Cannot transfer to the same account"
+)
 async def transfer(request: TransferRequest) -> TransferResponse:
     """
     Transfer funds between accounts.
-    
+
     Creates accounts if they don't exist.
-    
-    Contract validations:
-    - amount must be > 0
-    - source and destination must be different accounts
-    - source account must have sufficient funds
+
+    Contract validations (enforced by fastapi-icontract):
+    - amount must be > 0 (precondition)
+    - source and destination must be different accounts (precondition)
+    - source account must have sufficient funds (enforced by BankAccount.transfer_to)
     """
+    from_account = get_or_create_account(request.from_id)
+    to_account = get_or_create_account(request.to_id)
+
+    # The BankAccount.transfer_to method has its own contracts
     try:
-        from_account = get_or_create_account(request.from_id)
-        to_account = get_or_create_account(request.to_id)
         from_account.transfer_to(to_account, request.amount)
         return TransferResponse(
             from_account={"account_id": from_account.account_id, "balance": from_account.balance},
@@ -169,7 +198,12 @@ async def transfer(request: TransferRequest) -> TransferResponse:
             message=f"Successfully transferred {request.amount} from {request.from_id} to {request.to_id}"
         )
     except icontract.ViolationError as e:
-        raise handle_contract_violation(e, "transfer")
+        # Map specific contract violations to appropriate HTTP status codes
+        error_msg = str(e)
+        if "Insufficient funds" in error_msg:
+            from fastapi import HTTPException
+            raise HTTPException(status_code=409, detail=handle_contract_violation(e, "transfer"))
+        raise
 
 
 @app.get("/account/{account_id}", response_model=AccountResponse)
@@ -200,4 +234,24 @@ async def clear_accounts() -> dict:
 async def health_check() -> dict:
     """Health check endpoint."""
     return {"status": "healthy", "service": "banking-api"}
+
+
+# ============================================================================
+# FastAPI-icontract Integration
+# ============================================================================
+# This section integrates contracts into the OpenAPI specification and
+# enhances the Swagger UI with contract visualization.
+
+from fastapi_icontract import wrap_openapi_with_contracts
+
+# Include contracts in the OpenAPI specification (/openapi.json)
+# This makes contracts visible to API consumers and tools
+wrap_openapi_with_contracts(app=app)
+
+# Note: set_up_route_for_docs_with_contracts_plugin is available but optional
+# It provides enhanced Swagger UI visualization of contracts
+# Uncomment the following lines to enable it:
+#
+# from fastapi_icontract import set_up_route_for_docs_with_contracts_plugin
+# set_up_route_for_docs_with_contracts_plugin(app=app)
 
